@@ -139,9 +139,7 @@ def st_data_cleaning(st_enrollment_data, transfer_credit_data):
                         'FA', 'F', 'I', 'S', 'NP', 'WA']
 
     ac_st_enrollment_data = ac_st_enrollment_data[~ac_st_enrollment_data["Major"].isin(values_to_delete)]
-    ac_st_enrollment_data = ac_st_enrollment_data[~ac_st_enrollment_data["GRADE"].isin(values_to_delete)]
-
-    ac_st_enrollment_data = ac_st_enrollment_data[['Student_ID', 'Semester', 'Status', 'Student_Level',
+    ac_st_enrollment_data = ac_st_enrollment_data[['Student_ID', 'Semester','GRADE', 'Status', 'Student_Level',
                                      'Course_ID',"CREDITS", 'College', 'Program', 'Major', 'ADMIT_TERM',
                                      'Passed Credits', 'GPA', 'MPA']]
     
@@ -1132,6 +1130,29 @@ def remove_matches(row):
     unmatched_courses = eligible_courses - course_id  # Set difference to find unmatched courses
     return list(unmatched_courses)  # Return as list for compatibility
 
+# Function to process each row based on multiple course categories
+def process_row(row):
+    course_data = [
+        (['MATH100','MATH131','MATH132','MATH231','MATH140','MATH221','MATH211',
+          'MATH330','MATH111','MATH130','MATH121','MATH400','MATH331','MATH342',
+          'MATH232','MATH122','MATH120'],
+         ['MATH094','MATH095','MATH096','MATH098']),
+        
+        (['ENGL100','ENGL110','ENGL112'],
+         ['ENGL097','ENGL098']),
+         (['MATH096'],
+         ['MATH095','MATH094']),
+         (['MATH098'],
+         ['MATH096','MATH095','MATH094'])
+    ]
+
+    for check_courses, remove_courses in course_data:
+        if any(course in check_courses for course in row['Course_ID']):
+            row['Eligible_Courses_CO'] = [course for course in row['Eligible_Courses_CO'] if course not in remove_courses]
+    
+    return row
+
+
 def find_best_courses(group):
     sorted_courses = group.sort_values(by='Course_Score', ascending=False)
     return sorted_courses['Eligible_Courses_CO'].tolist()[:5]
@@ -1166,6 +1187,18 @@ def find_best_courses_cea_v2(group):
     sorted_courses = group.sort_values(by='Final_Score', ascending=False)
     return sorted_courses['Eligible_Courses_CO'].tolist()[:7]
 def process_data_acc(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Accounting']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     acc_data = st_hist_data[st_hist_data['Major'] == 'Accounting']
     acc_data = acc_data.sort_values(by=['Student_ID', 'Semester'])
@@ -1206,6 +1239,18 @@ def process_data_acc(st_hist_data,major_data, requirements_weights_path):
     courses_acc = cba_courses[cba_courses["Major"] == "ACCOUNTING"]
     
     grouped_data_acc = acc_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_acc, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -1314,7 +1359,31 @@ def process_data_acc(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_acc,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
 
     max_semester_index = acc_data.groupby('Student_ID')['Semester'].idxmax()
@@ -1323,11 +1392,11 @@ def process_data_acc(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, acc_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -1338,6 +1407,10 @@ def process_data_acc(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_acc,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -1393,6 +1466,18 @@ def process_data_acc(st_hist_data,major_data, requirements_weights_path):
     return requirements_acc_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_ib(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'International Business']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     ib_data = st_hist_data[st_hist_data['Major'] == 'International Business']
     ib_data = ib_data.sort_values(by=['Student_ID', 'Semester'])
@@ -1433,6 +1518,18 @@ def process_data_ib(st_hist_data,major_data, requirements_weights_path):
     courses_ib = cba_courses[cba_courses["Major"] == "INTL BUSIN"]
     
     grouped_data_ib = ib_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_ib, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -1541,7 +1638,31 @@ def process_data_ib(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_ib,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = ib_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = ib_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -1549,11 +1670,11 @@ def process_data_ib(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, ib_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -1564,6 +1685,10 @@ def process_data_ib(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_ib,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -1619,6 +1744,18 @@ def process_data_ib(st_hist_data,major_data, requirements_weights_path):
     return requirements_ib_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_mob(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Mgmt & Organizational Behavior']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     mob_data = st_hist_data[st_hist_data['Major'] == "Mgmt & Organizational Behavior"]
     mob_data = mob_data.sort_values(by=['Student_ID', 'Semester'])
@@ -1659,6 +1796,18 @@ def process_data_mob(st_hist_data,major_data, requirements_weights_path):
     courses_mob = cba_courses[cba_courses["Major"] == "MANAGEMENT"]
     
     grouped_data_mob = mob_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_mob, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -1767,7 +1916,31 @@ def process_data_mob(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mob,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = mob_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = mob_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -1775,11 +1948,11 @@ def process_data_mob(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, mob_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -1790,6 +1963,10 @@ def process_data_mob(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mob,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -1845,6 +2022,18 @@ def process_data_mob(st_hist_data,major_data, requirements_weights_path):
     return requirements_mob_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_mis(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Management Information Systems']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     mis_data = st_hist_data[st_hist_data['Major'] == "Management Information Systems"]
     mis_data = mis_data.sort_values(by=['Student_ID', 'Semester'])
@@ -1885,6 +2074,18 @@ def process_data_mis(st_hist_data,major_data, requirements_weights_path):
     courses_mis = cba_courses[cba_courses["Major"] == "MIS"]
     
     grouped_data_mis = mis_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_mis, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -1993,7 +2194,31 @@ def process_data_mis(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mis,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = mis_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = mis_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -2001,11 +2226,11 @@ def process_data_mis(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, mis_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -2016,6 +2241,10 @@ def process_data_mis(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mis,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -2071,6 +2300,18 @@ def process_data_mis(st_hist_data,major_data, requirements_weights_path):
     return requirements_mis_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_mrkt(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Marketing']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     mrkt_data = st_hist_data[st_hist_data['Major'] == "Marketing"]
     mrkt_data = mrkt_data.sort_values(by=['Student_ID', 'Semester'])
@@ -2111,6 +2352,18 @@ def process_data_mrkt(st_hist_data,major_data, requirements_weights_path):
     courses_mrkt = cba_courses[cba_courses["Major"] == "MARKETING2"]
     
     grouped_data_mrkt = mrkt_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_mrkt, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -2219,7 +2472,31 @@ def process_data_mrkt(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mrkt,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = mrkt_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = mrkt_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -2227,11 +2504,11 @@ def process_data_mrkt(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, mrkt_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -2242,6 +2519,10 @@ def process_data_mrkt(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mrkt,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -2297,6 +2578,18 @@ def process_data_mrkt(st_hist_data,major_data, requirements_weights_path):
     return requirements_mrkt_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_fin(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Finance']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     fin_data = st_hist_data[st_hist_data['Major'] == "Finance"]
     fin_data = fin_data.sort_values(by=['Student_ID', 'Semester'])
@@ -2337,6 +2630,18 @@ def process_data_fin(st_hist_data,major_data, requirements_weights_path):
     courses_fin = cba_courses[cba_courses["Major"] == "FINANCE"]
     
     grouped_data_fin = fin_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_fin, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -2445,7 +2750,31 @@ def process_data_fin(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_fin,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = fin_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = fin_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -2453,11 +2782,11 @@ def process_data_fin(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, fin_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -2468,6 +2797,10 @@ def process_data_fin(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_fin,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -2523,6 +2856,18 @@ def process_data_fin(st_hist_data,major_data, requirements_weights_path):
     return requirements_fin_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_cs(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Computer Science']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
     # Filtering and Sorting Data
     cs_data = st_hist_data[st_hist_data['Major'] == "Computer Science"]
     cs_data = cs_data.sort_values(by=['Student_ID', 'Semester'])
@@ -2563,6 +2908,18 @@ def process_data_cs(st_hist_data,major_data, requirements_weights_path):
     courses_cs = cas_courses[cas_courses["Major"] == "COMSCIENCE"]
     
     grouped_data_cs = cs_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_cs, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -2671,7 +3028,31 @@ def process_data_cs(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_cs,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = cs_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = cs_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -2679,11 +3060,11 @@ def process_data_cs(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, cs_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -2694,6 +3075,10 @@ def process_data_cs(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_cs,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -2749,6 +3134,18 @@ def process_data_cs(st_hist_data,major_data, requirements_weights_path):
     return requirements_cs_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_dmp(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Digital Media Production']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     dmp_data = st_hist_data[st_hist_data['Major'] == "Digital Media Production"]
     dmp_data = dmp_data.sort_values(by=['Student_ID', 'Semester'])
@@ -2789,6 +3186,18 @@ def process_data_dmp(st_hist_data,major_data, requirements_weights_path):
     courses_dmp = cas_courses[cas_courses["Major"] == "DIGITALMED"]
     
     grouped_data_dmp = dmp_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_dmp, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -2897,7 +3306,31 @@ def process_data_dmp(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_dmp,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = dmp_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = dmp_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -2905,11 +3338,11 @@ def process_data_dmp(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, dmp_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -2920,6 +3353,10 @@ def process_data_dmp(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_dmp,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -2975,6 +3412,18 @@ def process_data_dmp(st_hist_data,major_data, requirements_weights_path):
     return requirements_dmp_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_eng_lin(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Eng- Linguistics - Translation']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     eng_lin_data = st_hist_data[st_hist_data['Major'] == "Eng- Linguistics - Translation"]
     eng_lin_data = eng_lin_data.sort_values(by=['Student_ID', 'Semester'])
@@ -3015,6 +3464,18 @@ def process_data_eng_lin(st_hist_data,major_data, requirements_weights_path):
     courses_eng_lin = cas_courses[cas_courses["Major"] == "LINGUISTIC"]
     
     grouped_data_eng_lin = eng_lin_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_eng_lin, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -3123,7 +3584,31 @@ def process_data_eng_lin(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_eng_lin,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
     
     max_semester_index = eng_lin_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = eng_lin_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -3131,11 +3616,11 @@ def process_data_eng_lin(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, eng_lin_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -3146,6 +3631,10 @@ def process_data_eng_lin(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_eng_lin,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -3201,6 +3690,18 @@ def process_data_eng_lin(st_hist_data,major_data, requirements_weights_path):
     return requirements_eng_lin_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_eng_edu(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'English Education']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     eng_edu_data = st_hist_data[st_hist_data['Major'] == "English Education"]
     eng_edu_data = eng_edu_data.sort_values(by=['Student_ID', 'Semester'])
@@ -3241,6 +3742,18 @@ def process_data_eng_edu(st_hist_data,major_data, requirements_weights_path):
     courses_eng_edu = cas_courses[cas_courses["Major"] == "ENGLISH"]
     
     grouped_data_eng_edu = eng_edu_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_eng_edu, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -3349,7 +3862,31 @@ def process_data_eng_edu(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_eng_edu,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = eng_edu_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = eng_edu_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -3357,11 +3894,11 @@ def process_data_eng_edu(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, eng_edu_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -3372,6 +3909,10 @@ def process_data_eng_edu(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_eng_edu,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -3427,6 +3968,18 @@ def process_data_eng_edu(st_hist_data,major_data, requirements_weights_path):
     return requirements_eng_edu_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_eng_lit(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'English Literature']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     eng_lit_data = st_hist_data[st_hist_data['Major'] == "English Literature"]
     eng_lit_data = eng_lit_data.sort_values(by=['Student_ID', 'Semester'])
@@ -3467,6 +4020,18 @@ def process_data_eng_lit(st_hist_data,major_data, requirements_weights_path):
     courses_eng_lit = cas_courses[cas_courses["Major"] == "LITERATURE"]
     
     grouped_data_eng_lit = eng_lit_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_eng_lit, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -3575,7 +4140,31 @@ def process_data_eng_lit(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_eng_lit,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = eng_lit_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = eng_lit_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -3583,11 +4172,11 @@ def process_data_eng_lit(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, eng_lit_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -3598,6 +4187,10 @@ def process_data_eng_lit(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_eng_lit,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -3653,6 +4246,18 @@ def process_data_eng_lit(st_hist_data,major_data, requirements_weights_path):
     return requirements_eng_lit_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_pr(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Public relations & Advertising']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     pr_data = st_hist_data[st_hist_data['Major'] == "Public relations & Advertising"]
     pr_data = pr_data.sort_values(by=['Student_ID', 'Semester'])
@@ -3693,6 +4298,18 @@ def process_data_pr(st_hist_data,major_data, requirements_weights_path):
     courses_pr = cas_courses[cas_courses["Major"] == "PR / ADV"]
     
     grouped_data_pr = pr_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_pr, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -3801,7 +4418,31 @@ def process_data_pr(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_pr,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = pr_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = pr_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -3809,11 +4450,11 @@ def process_data_pr(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, pr_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -3824,6 +4465,10 @@ def process_data_pr(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_pr,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -3879,6 +4524,18 @@ def process_data_pr(st_hist_data,major_data, requirements_weights_path):
     return requirements_pr_,student_progress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_vc(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Visual Communication']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     vc_data = st_hist_data[st_hist_data['Major'] == "Visual Communication"]
     vc_data = vc_data.sort_values(by=['Student_ID', 'Semester'])
@@ -3919,6 +4576,18 @@ def process_data_vc(st_hist_data,major_data, requirements_weights_path):
     courses_vc = cas_courses[cas_courses["Major"] == "VISUAL COM"]
     
     grouped_data_vc = vc_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_vc, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -4027,7 +4696,31 @@ def process_data_vc(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_vc,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = vc_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = vc_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -4035,11 +4728,11 @@ def process_data_vc(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, vc_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -4050,6 +4743,10 @@ def process_data_vc(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_vc,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -4105,6 +4802,18 @@ def process_data_vc(st_hist_data,major_data, requirements_weights_path):
     return requirements_vc_,student_vcogress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_mgmt(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Engineering Management']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     mgmt_data = st_hist_data[st_hist_data['Major'] == "Engineering Management"]
     mgmt_data = mgmt_data.sort_values(by=['Student_ID', 'Semester'])
@@ -4144,6 +4853,18 @@ def process_data_mgmt(st_hist_data,major_data, requirements_weights_path):
     courses_mgmt = cea_courses[cea_courses["Major"] == "MGMTENG"]
     
     grouped_data_mgmt = mgmt_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_mgmt, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -4252,7 +4973,31 @@ def process_data_mgmt(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mgmt,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = mgmt_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = mgmt_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -4260,11 +5005,11 @@ def process_data_mgmt(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, mgmt_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -4275,6 +5020,10 @@ def process_data_mgmt(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_mgmt,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -4330,6 +5079,18 @@ def process_data_mgmt(st_hist_data,major_data, requirements_weights_path):
     return requirements_mgmt_,student_mgmtogress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_elec(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Electrical Engineering']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     elec_data = st_hist_data[st_hist_data['Major'] == "Electrical Engineering"]
     elec_data = elec_data.sort_values(by=['Student_ID', 'Semester'])
@@ -4369,6 +5130,18 @@ def process_data_elec(st_hist_data,major_data, requirements_weights_path):
     courses_elec = cea_courses[cea_courses["Major"] == "ELECENG"]
     
     grouped_data_elec = elec_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_elec, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -4477,7 +5250,31 @@ def process_data_elec(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_elec,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = elec_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = elec_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -4485,11 +5282,11 @@ def process_data_elec(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, elec_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -4500,6 +5297,10 @@ def process_data_elec(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_elec,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -4555,6 +5356,18 @@ def process_data_elec(st_hist_data,major_data, requirements_weights_path):
     return requirements_elec_,student_elecogress,summary_area_of_study_taken,remaining_courses_df,latest_eligible_courses,eligible_courses_comprehensive_data,recommended_courses,summary_area_of_study_eligible
 
 def process_data_comp(st_hist_data,major_data, requirements_weights_path):
+    
+    values_to_delete = ['FA', 'F', 'I', 'S', 'NP', 'WA']
+    failed_grades = ['F','FA','NP']
+    failed_data = st_hist_data[st_hist_data["GRADE"].isin(failed_grades)]
+    st_hist_data = st_hist_data[~st_hist_data["GRADE"].isin(values_to_delete)]
+    
+    # Filtering and Sorting Data
+    failed_data = failed_data[failed_data['Major'] == 'Computer Engineering']
+    failed_data = failed_data.sort_values(by=['Student_ID', 'Semester'])
+
+    grouped_data_failed = failed_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+    
     # Filtering and Sorting Data
     comp_data = st_hist_data[st_hist_data['Major'] == "Computer Engineering"]
     comp_data = comp_data.sort_values(by=['Student_ID', 'Semester'])
@@ -4594,6 +5407,18 @@ def process_data_comp(st_hist_data,major_data, requirements_weights_path):
     courses_comp = cea_courses[cea_courses["Major"] == "COMPENG"]
     
     grouped_data_comp = comp_data.groupby(['Student_ID'])['Course_ID'].apply(list).reset_index()
+
+    # Merge dataframes
+    merged_df = grouped_data_failed.merge(grouped_data_comp, on=['Student_ID'], how='outer', suffixes=('_failed', '_all'))
+    # Replace NaN with empty lists to avoid errors
+    merged_df['Course_ID_all'] = merged_df['Course_ID_all'].apply(lambda x: x if isinstance(x, list) else [])
+    merged_df['Course_ID_failed'] = merged_df['Course_ID_failed'].apply(lambda x: x if isinstance(x, list) else [])
+
+    merged_df['Failed_Courses'] = merged_df.apply(
+        lambda row: list(set(row['Course_ID_failed']) - set(row['Course_ID_all'])),
+        axis=1)
+    # Keep only relevant columns
+    merged_df = merged_df[['Student_ID', 'Failed_Courses']]
 
     # Extract Accounting specific requirements and weights from respective DataFrames
     requirements_df = pd.read_excel(requirements_weights_path,sheet_name="requirements")
@@ -4702,7 +5527,31 @@ def process_data_comp(st_hist_data,major_data, requirements_weights_path):
     latest_eligible_courses = latest_eligible_courses.groupby('Student_ID').first().reset_index()
     latest_eligible_courses = latest_eligible_courses.merge(grouped_data_comp,on = "Student_ID",how = "inner")
     latest_eligible_courses["Eligible_Courses_CO"] = latest_eligible_courses.apply(remove_matches, axis=1)
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
     latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
+
+    latest_eligible_courses = latest_eligible_courses.merge(merged_df, on='Student_ID', how='outer')
+    latest_eligible_courses['Failed_Courses'] = latest_eligible_courses['Failed_Courses'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses.apply(
+        lambda row: list(set(row['Eligible_Courses_CO']) | (set(row['Failed_Courses']) - set(row['Eligible_Courses_CO']))),axis=1)
+    latest_eligible_courses = latest_eligible_courses.drop(columns=['Failed_Courses'])
+
+    latest_info_failed = failed_data.loc[failed_data.groupby("Student_ID")["Semester"].idxmax()]
+    missing_semester_df = latest_eligible_courses[latest_eligible_courses['Semester'].isna()]
+    latest_eligible_courses.dropna(inplace=True)
+    columns_to_fill = ['Semester', 'Major', 'College', 'Program', 'Passed Credits', 'Student_Level']
+
+    for col in columns_to_fill:
+        missing_semester_df.loc[missing_semester_df[col].isna(), col] = missing_semester_df.loc[
+            missing_semester_df[col].isna(), 'Student_ID'
+        ].map(latest_info_failed.set_index('Student_ID')[col])
+
+    columns_to_convert = ['Semester', 'Student_Level', 'Passed Credits']
+    for col in columns_to_convert:
+        latest_eligible_courses.loc[:, col] = pd.to_numeric(latest_eligible_courses[col], errors='coerce').astype('Int64')
+        
+    latest_eligible_courses = pd.concat([latest_eligible_courses, missing_semester_df], ignore_index=True)
 
     max_semester_index = comp_data.groupby('Student_ID')['Semester'].idxmax()
     max_semester_data = comp_data.loc[max_semester_index, ['Student_ID', 'Semester']]
@@ -4710,11 +5559,11 @@ def process_data_comp(st_hist_data,major_data, requirements_weights_path):
     last_semester_courses = pd.merge(max_semester_data, comp_data, on=['Student_ID', 'Semester'])
     eng097_fpu_students = last_semester_courses[last_semester_courses['Course_ID'] == 'ENGL097']
     # Target course list
-    target_courses = ['ENGL098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
+    target_courses = ['ENGL098', 'MATH094', 'MATH095', 'MATH096', 'MATH098', 'MATH100', 'MATH111', 'MATH120', 'MATH121', 'MATH131', 'MATH140']
 
-    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID'].isin(eng097_fpu_students['Student_ID'])]
-    # Keep only matching courses from Eligible_Courses_CO
-    eng097_fpu_students_eligible['Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
+    eng097_fpu_students_eligible = latest_eligible_courses[latest_eligible_courses['Student_ID']
+                                                       .isin(eng097_fpu_students['Student_ID'])].copy()
+    eng097_fpu_students_eligible.loc[:, 'Eligible_Courses_CO'] = eng097_fpu_students_eligible['Eligible_Courses_CO'].apply(
     lambda courses: [course for course in courses if course in target_courses])
 
     latest_eligible_courses = latest_eligible_courses.merge(
@@ -4725,6 +5574,10 @@ def process_data_comp(st_hist_data,major_data, requirements_weights_path):
 
     latest_eligible_courses['Eligible_Courses_CO'] = latest_eligible_courses['Eligible_Courses_CO_updated'].combine_first(latest_eligible_courses['Eligible_Courses_CO'])
     latest_eligible_courses = latest_eligible_courses.drop(columns=['Eligible_Courses_CO_updated'])
+    latest_eligible_courses = latest_eligible_courses.merge(grouped_data_comp,on = "Student_ID",how = "outer")
+    latest_eligible_courses['Course_ID'] = latest_eligible_courses['Course_ID'].apply(lambda x: x if isinstance(x, list) else [])
+    latest_eligible_courses = latest_eligible_courses.apply(process_row, axis=1)
+    latest_eligible_courses.drop(columns=["Course_ID"], inplace=True)
 
     # Exploding DataFrame and mapping course details
     eligible_courses_comprehensive_data = latest_eligible_courses.explode("Eligible_Courses_CO")
@@ -5250,6 +6103,8 @@ if navigation == "Quick Check":
 
         # Ensure that course IDs are selected
         course_id = st.multiselect(f"Course ID (Semester {i + 1}):", course_list, key=f"course_id_{i}")
+        grades_list = ["'A','A-'"]
+        grades = st.multiselect(f"Grade (Semester {i + 1}):", grades_list)
         incoming_pcr = st.number_input(f"Incoming PCR (Semester {i + 1}):", value=0, min_value=0)
 
         
@@ -5265,6 +6120,7 @@ if navigation == "Quick Check":
             'Program': program,
             'Major': major,
             'Course_ID': course_id,
+            'GRADE':grades,
             "Incoming_PCR": incoming_pcr
         }
         student_info_list.append(student_info)
