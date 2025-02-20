@@ -6103,7 +6103,7 @@ if navigation == "Quick Check":
 
         # Ensure that course IDs are selected
         course_id = st.multiselect(f"Course ID (Semester {i + 1}):", course_list, key=f"course_id_{i}")
-        grades_list = ["'A','A-'"]
+        grades_list = ["P"]
         grades = st.multiselect(f"Grade (Semester {i + 1}):", grades_list)
         incoming_pcr = st.number_input(f"Incoming PCR (Semester {i + 1}):", value=0, min_value=0)
 
