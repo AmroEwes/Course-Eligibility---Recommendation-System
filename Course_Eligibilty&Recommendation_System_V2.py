@@ -80,6 +80,7 @@ def st_data_cleaning(st_enrollment_data, transfer_credit_data):
             
     # Convert relevant columns to appropriate types
     ac_st_enrollment_data["Student_Level"] = ac_st_enrollment_data["Student_Level"].str.extract('(\d+)', expand=False)
+    ac_st_enrollment_data = ac_st_enrollment_data.dropna(subset=["Student_Level"])
     ac_st_enrollment_data["Semester"] = ac_st_enrollment_data["Semester"].astype(int)
     ac_st_enrollment_data["Student_Level"] = ac_st_enrollment_data["Student_Level"].astype(int)
     ac_st_enrollment_data["CREDITS"] = ac_st_enrollment_data["CREDITS"].astype(float)
@@ -5635,114 +5636,57 @@ def process_data_comp(st_hist_data,major_data, requirements_weights_path):
 
 # Define the query
 st_enrollment_query = """
-SELECT 
-    q1.EMPLID,
-    q1.Status,
-    q1.STRM,
-    q1.Level,
-    q1.Course,
-    q1.GRADE,
-    q1.CREDITS,
-    q1.Course_Department,
-    q1.College,
-    q1.Program,
-    q1.[Plan],
-    q1.ADMIT_TERM,
-    q1.ACAD_PROG,
-    q1.ACAD_PLAN,
-    q1.[Passed Credits],
-    q1.CUM_GPA,
-    q1.MPA,
-    q2.PROG_STATUS,
-    q2.ACAD_CAREER
-FROM 
-    (
-        -- Begin query1
-        SELECT DISTINCT 
-            A.EMPLID,
-            CASE WHEN AP.PROG_STATUS = 'AC' THEN 'Active'
-                 WHEN AP.PROG_STATUS = 'CN' THEN 'University Withdrawal'
-                 WHEN AP.PROG_STATUS = 'CM' THEN 'Graduated'
-                 WHEN AP.PROG_STATUS = 'DM' THEN 'Dismissed'
-                 WHEN AP.PROG_STATUS = 'DC' THEN 'Discontinue'
-                 WHEN AP.PROG_STATUS = 'LA' THEN 'Leave of Absence'
-                 WHEN AP.PROG_STATUS = 'SP' THEN 'Suspended'
-                 ELSE X.XLATLONGNAME END AS Status,   
-            A.STRM,
-            CASE WHEN T.ACAD_LEVEL_BOT = '10' THEN '1- Freshman'
-                 WHEN T.ACAD_LEVEL_BOT = '20' THEN '2- Sophomore'
-                 WHEN T.ACAD_LEVEL_BOT = '30' THEN '3- Junior'
-                 WHEN T.ACAD_LEVEL_BOT = '40' THEN '4- Senior'
-                 ELSE 'NA' END AS Level,
-            LTRIM(RTRIM(A.SUBJECT)) + LTRIM(RTRIM(A.CATALOG_NBR)) AS Course,
-            A.CRSE_GRADE_OFF AS GRADE,
-            A.UNT_TAKEN AS CREDITS,
-            G.DESCR AS Course_Department,
-            PR.ACAD_GROUP AS College,
-            PR.DESCR AS Program,
-            PL.DESCR AS [Plan],
-            AP.ADMIT_TERM,
-            AP.ACAD_PROG,
-            APL.ACAD_PLAN,
-            S.TOT_CUMULATIVE AS [Passed Credits],
-            S.CUM_GPA,
-            S.GU_MPA AS MPA
-        FROM 
-            [MFPS09].[SIS89PRD].dbo.PS_STDNT_ENRL_L_VW A 
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_ACAD_PROG AP ON AP.EMPLID = A.EMPLID 
-            AND AP.EFFDT = (SELECT MAX(AP1.EFFDT) FROM [MFPS09].[SIS89PRD].dbo.PS_ACAD_PROG AP1 WHERE AP1.EMPLID = AP.EMPLID)
-            AND AP.EFFSEQ = (SELECT MAX(AP1.EFFSEQ) FROM [MFPS09].[SIS89PRD].dbo.PS_ACAD_PROG AP1 WHERE AP1.EMPLID = AP.EMPLID AND AP.EFFDT = AP1.EFFDT)
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_ACAD_PLAN APL ON APL.EMPLID = AP.EMPLID AND APL.EFFDT = AP.EFFDT AND APL.EFFSEQ = AP.EFFSEQ
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PSXLATITEM X ON X.FIELDNAME = 'PROG_STATUS' AND X.FIELDVALUE = AP.PROG_STATUS
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_STDNT_CAR_TERM T ON A.EMPLID = T.EMPLID AND T.STRM = A.STRM
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_GU_STDNT_STATS S ON A.EMPLID = S.EMPLID AND S.STRM = (SELECT MAX(S1.STRM) FROM [MFPS09].[SIS89PRD].dbo.PS_GU_STDNT_STATS S1 WHERE S1.EMPLID = S.EMPLID AND S1.STRM <= A.STRM)
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_GU_CRSE_DEPT D ON A.CRSE_ID = D.CRSE_ID AND D.EFFDT = (SELECT MAX(D1.EFFDT) FROM [MFPS09].[SIS89PRD].dbo.PS_GU_CRSE_DEPT D1 WHERE D1.CRSE_ID = D.CRSE_ID)
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_GU_DEPT_TBL G ON D.DEPTID = G.DEPTID
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_ACAD_PROG_TBL PR ON PR.ACAD_PROG = AP.ACAD_PROG AND PR.EFFDT = (SELECT MAX(PR1.EFFDT) FROM [MFPS09].[SIS89PRD].dbo.PS_ACAD_PROG_TBL PR1 WHERE PR1.ACAD_PROG = PR.ACAD_PROG)
-        LEFT JOIN 
-            [MFPS09].[SIS89PRD].dbo.PS_ACAD_PLAN_TBL PL ON LTRIM(RTRIM(PL.ACAD_PLAN)) = APL.ACAD_PLAN AND PL.EFFDT = (SELECT MAX(PL1.EFFDT) FROM [MFPS09].[SIS89PRD].dbo.PS_ACAD_PLAN_TBL PL1 WHERE PL1.ACAD_PLAN = PL.ACAD_PLAN)
-        WHERE 
-            A.STRM >= '0801' 
-            AND A.STDNT_ENRL_STATUS = 'E' 
-            AND A.ENRL_STATUS_REASON IN ('ENRL', 'EWAT')
-            AND A.GRADING_BASIS_ENRL <> 'NON'
-            AND A.ACAD_CAREER = 'UGRD'
-        -- End query1
-    ) AS q1
-INNER JOIN 
-    (
-        -- Begin query2
-        SELECT *
-        FROM SIS_STUDENT_STATUS 
-        WHERE PROG_STATUS IN ('AC', 'LA')
-          AND ACAD_CAREER = 'UGRD'
-        -- End query2
-    ) AS q2
-ON q1.EMPLID COLLATE SQL_Latin1_General_CP1_CI_AS = q2.STUDENT_ID COLLATE SQL_Latin1_General_CP1_CI_AS
-ORDER BY q1.STRM, q1.EMPLID;
-
+SELECT
+    asef.StudentId AS EMPLID,
+	asef.ProgramStatusTitle AS Status,
+	asef.Semester AS STRM,
+	CASE 
+        WHEN asef.AcademicLevelID = '10' THEN '1- Freshman'
+        WHEN asef.AcademicLevelID = '20' THEN '2- Sophomore'
+        WHEN asef.AcademicLevelID = '30' THEN '3- Junior'
+        WHEN asef.AcademicLevelID = '40' THEN '4- Senior'
+        ELSE 'NA' 
+    END AS Level,
+	CONCAT(TRIM(CourseSubject), TRIM(CourseCode)) AS Course,
+	asef.LetterGrade AS GRADE,
+	asef.CourseUnits AS CREDITS,
+	asef.CourseDepartmentDescription AS Course_Department,
+	asef.StudentCollegeID AS College,
+	asef.StudentProgramDescription AS Program,
+	asef.StudentPlanDescription AS 'Plan',
+	asef.AdmitSemester AS ADMIT_TERM,
+	asef.StudentProgramID AS ACAD_PROG,
+	asef.StudentPlanID AS ACAD_PLAN,
+	asef.UnitPassed AS 'Passed Credits',
+	asef.CumulativeGPA AS CUM_GPA,
+	asef.MPA,
+	asef.ProgramStatusID AS PROG_STATUS,
+	sm.AcademicCareer AS ACAD_CAREER
+FROM [GUST-DW-Staging].DataBridge.ActiveStudentEnrollmentFull AS asef
+INNER JOIN [GUST-DW-Staging].DataBridge.StudentMaster AS sm
+    ON asef.StudentID = sm.StudentID
+WHERE 
+    sm.AcademicCareer = N'UGRD' 
+    AND sm.ProgramStatusID IN (N'AC  ', N'LA  ')
+	AND asef.ClassType = 'E'
+	order by asef.Semester,asef.StudentID;
 """
 
 tc_query = """
 SELECT 
-    CONCAT(TRIM(SUBJECT), TRIM(CATALOG_NBR)) AS Course_ID, 
-    * 
-FROM 
-    SIS_TRANSFER_COURSES WHERE 
-    STUDENT_ID COLLATE Latin1_General_BIN IN (
-        SELECT STUDENT_ID 
-        FROM SIS_STUDENT_STATUS 
-        WHERE PROG_STATUS IN ('AC', 'LA') 
-          AND ACAD_CAREER = 'UGRD'
-    );
+	CONCAT(TRIM(CourseSubject), TRIM(CourseCode)) AS Course_ID,
+	sct.StudentID AS STUDENT_ID,
+	sm.Fullname AS STUDENT_NAME,
+	TransferSemester AS TRANSFER_TERM,
+	TransferUnit AS UNT_TRNSFR,
+	CourseSubject AS SUBJECT,
+	CourseCode AS CATALOG_NBR
+FROM [GUST-DW-Staging].DataBridge.StudentCourseTransfer AS sct
+INNER JOIN [GUST-DW-Staging].DataBridge.StudentMaster AS sm
+    ON sct.StudentID = sm.StudentID
+WHERE 
+    sm.AcademicCareer = N'UGRD' 
+    AND sm.ProgramStatusID IN (N'AC  ', N'LA  ')
     
 """
 
@@ -5891,7 +5835,7 @@ elif navigation == "Course Eligibility and Recommendation System":
                 ac_st_enrollment_data = fetch_data_from_db(st_enrollment_query)
                 tc_data = fetch_data_from_db(tc_query)
                 st_hist_data = st_data_cleaning(ac_st_enrollment_data,tc_data)
-                st_hist_data = st_hist_data[st_hist_data["Semester"] != 2402]
+                #st_hist_data = st_hist_data[st_hist_data["Semester"] < 2203]
             except Exception as e:
                 st.error(f"Error loading sheets: {e}")
 
